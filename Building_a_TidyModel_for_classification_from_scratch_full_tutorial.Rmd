@@ -841,7 +841,7 @@ final_rf_fit <-
   final_rf_wf %>% 
   last_fit(split)
 
-final_rf_fit_fitted_metrics <- final_fit %>% 
+final_rf_fit_fitted_metrics <- final_rf_fit %>% 
   collect_metrics() 
 
 print(final_rf_fit_fitted_metrics)
@@ -867,6 +867,193 @@ print(roc_plot_rf)
 ggsave(filename = "Figures/tuned_rf.png", plot=roc_plot_rf)
 
 ```
+
+# Improve XGBoost model with hyperparameter tuning with the Dials package
+
+We are going to now create a XGBoost model and we are going to tune the hyperparameters using the dials package. The dials package contains a list of hyperparameter tuning methods and is useful for creating quick hyperparameter grids and aiming to optimise them.
+
+## Building the Tuned XGBoost Model
+
+Like all the other steps, the first thing to do is build the XGBoost model Note - the reason set_model("classification") is because the thing we are predicting is a factor. If this was a continuous variable, then you would need to switch this to regression. However, the model development for regression is identical to classification.
+
+```{r build_tune_xgboost}
+tune_xgboost <- 
+  boost_tree(tree_depth = tune(),
+             trees = tune(),
+             min_n = tune()) %>%
+  set_engine('xgboost') %>%
+  set_mode('classification')
+
+print(tune_xgboost)
+```
+
+## Create the hyperparameter grid search
+
+The next step is to fill these blank values for mtry, trees, and min_n using grid_max_entropy
+
+We will now create the object:
+
+```{r build_tuning_xgboost}
+grid_xgboost_tune <- grid_max_entropy(
+  trees(range = c(200,500)),
+  min_n(range = c(2, 40)),
+  tree_depth(range = c(1, 15)),
+  size = 30,
+  iter = 1000
+    )
+print(head(grid_xgboost_tune,20))
+```
+
+## Setting up parallel processing
+
+The tuning process, and modeling process, normally needs the ML engineer to access the full potential of your machine. The next steps show how to register the cores on your machine and max them out for training the model and doing grid searching:
+
+```{r parallelproc_xgboost}
+all_cores <- parallel::detectCores(logical = FALSE)-1
+print(all_cores)
+#Registers all cores and subtracts one, so you have some time to work
+cl <- makePSOCKcluster(all_cores)
+print(cl)
+#Makes an in memory cluster to utilise your cores
+registerDoParallel(cl)
+#Registers that we want to do parallel processing
+```
+
+## Creating the model workflow
+
+Next, I will create the model workflow, as we have done a few times before:
+
+```{r parallelproc3}
+set.seed(123)
+xgboost_wf <- workflow() %>% 
+  add_model(tune_xgboost) %>% 
+  add_formula(stranded_class ~ .)
+# Make the decision tree workflow - always postfix with wf for convention
+# Add the registered model
+# Add the formula of the outcome class you are predicting against all IVs
+
+xgboost_pred_tuned <- 
+  xgboost_wf %>% 
+  tune::tune_grid(
+    resamples = ten_fold, #This is the 10 fold cross validation variable we created earlier
+    grid = grid_xgboost_tune #This is the tuning grid
+  )
+
+```
+
+## Visualise the tuning process
+
+I tried to mimic the visualization with the random forest model but it looks weird!!
+
+```{r tune_visual_xgboost}
+tune_xgboost_plot <- xgboost_pred_tuned %>%
+  collect_metrics() %>% #Collect metrics from tuning
+  mutate(trees = factor(trees)) %>%
+  ggplot(aes(mtry, mean, color = trees)) +
+  geom_line(size = 1, alpha = 0.7) +
+  geom_point(size = 1.5) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0) + theme_minimal()
+
+print(tune_xgboost_plot)
+ggsave(filename="Figures/hyperparameter_xg.png", tune_xgboost_plot)
+
+```
+
+## Selecting the best model from the tuning process with Tune
+
+The tune package allows us to select the best candidate model, with the most optimal set of hyperparameters:
+
+```{r tune_xgboost_best}
+# To get the best ROC - area under the curve value we will use the following:
+xgboost_pred_tuned %>% 
+  tune::show_best("roc_auc")
+
+# Select the best tree
+best_xgboost <- xgboost_pred_tuned %>% 
+  tune::select_best("roc_auc")
+
+print(best_rf)
+
+```
+
+The next step is to us the best rf to make our predictions.
+
+## Using best tree to make predictions
+
+```{r tune_best_select_xgboost}
+final_xgboost_wf <- 
+  xgboost_wf %>% 
+  finalize_workflow(best_xgboost) #Finalise workflow passes in our best tree
+
+print(final_rf_wf)
+
+```
+
+Make a prediction against this finalized xgboost:
+
+```{r tune_best_xgboost_selected}
+final_xgboost_pred <- 
+  final_xgboost_wf %>% 
+  fit(data = train_data)
+
+print(final_xgboost_pred)
+
+```
+
+## Use VIP package to visualise variable importance
+
+We will look at global variable importance. As mentioned prior, to look at local patient level importance, use the LIME package.
+
+```{r wf_xgboost_fit}
+plot_xgboost <- final_xgboost_pred %>% 
+  pull_workflow_fit() %>% 
+  vip(aesthetics = list(color = "black", fill = "#26ACB5")) + theme_minimal()
+
+print(plot_xgboost)
+ggsave("Figures/VarImp_xgboost.png", plot_xgboost)
+
+```
+
+## Create the final predictions
+
+The last step is to create the final predictions from the tuned decision tree:
+
+```{r final_xgboost_fitted}
+# Create the final prediction
+final_xgboost_fit <- 
+  final_xgboost_wf %>% 
+  last_fit(split)
+
+final_xgboost_fit_fitted_metrics <- final_xgboost_fit %>% 
+  collect_metrics() 
+
+print(final_xgboost_fit_fitted_metrics)
+
+#Create the final predictions
+final_xgboost_fit_predictions <- final_xgboost_fit %>% 
+  collect_predictions()
+print(final_xgboost_fit_predictions)
+
+
+```
+
+## Visualise the final fit on a ROC curve
+
+You could do similar with viewing this object in the confusion matrix add in, but I will view this on a plot:
+
+```{r final_xgboost_fit}
+roc_plot_xgboost <- final_xgboost_fit_predictions %>% 
+  roc_curve(stranded_class, `.pred_Not Stranded`) %>% 
+  autoplot()
+
+print(roc_plot_xgboost)
+ggsave(filename = "Figures/tuned_xgboost.png", plot=roc_plot_xgboost)
+
+```
+
+# 
 
 # Inspecting any Parsnip object
 
